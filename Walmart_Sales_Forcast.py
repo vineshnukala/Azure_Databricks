@@ -1,13 +1,13 @@
 # Databricks notebook source
 # configs={"fs.azure.account.auth.type": "OAuth",
 #         "fs.azure.account.oauth.provider.type": "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider",
-#         "fs.azure.account.oauth2.client.id": "e52a57e8-947d-4c40-9952-3cf9dd3f83d5",
-#         "fs.azure.account.oauth2.client.secret": "66anx3S57049LRk7kHoYDcWi-qyC__-6oA",
-#         "fs.azure.account.oauth2.client.endpoint": "https://login.microsoftonline.com/f729dc92-7f20-4c3a-a702-208d6bb1299c/oauth2/token"}
+#         "fs.azure.account.oauth2.client.id": "*****",
+#         "fs.azure.account.oauth2.client.secret": "******",
+#         "fs.azure.account.oauth2.client.endpoint": "*******"}
 
 # # Optionally, you can add <directory-name> to the source URI of your mount point.
 # dbutils.fs.mount(
-#   source = "abfss://data@wal203.dfs.core.windows.net/",
+#   source = "abfss://data@******.dfs.core.windows.net/",
 #   mount_point = "/mnt/datalakegen2",
 #   extra_configs = configs)
 
