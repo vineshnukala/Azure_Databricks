@@ -110,7 +110,8 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.ml import Pipeline
 from pyspark.ml.tuning import CrossValidator
 from pyspark.ml.evaluation import RegressionEvaluator
-from hyperopt import fmin, tpe, hp, SparkTrials, STATUS_OK, Trials
+from hyperopt import fmin, tpe, hp, SparkTrials, Trials, STATUS_OK
+import cloudpickle
 
 #assemble the training vector 
 (trainingData, testData) = df_random.randomSplit([0.8, 0.2])
@@ -121,40 +122,159 @@ testData_Assembler=assembler.transform(testData)
 # COMMAND ----------
 
 #define the function to minimize 
-
+import mlflow
 def hyper_min(params):
-    params = {'maxDepth': int(params['maxDepth']), 
-                  'numTrees': int(params['numTrees']), 
-                 'featureSubsetStrategy': str(int(params['featureSubsetStrategy']))}
-    rf = RandomForestRegressor(labelCol="Weekly_Sales", featuresCol="features",**params)
-    rf_model=rf.fit(trainingData_Assembler)
-    prediction=rf_model.transform(testData_Assembler)
-    score=RegressionEvaluator(labelCol="Weekly_Sales", predictionCol="prediction", metricName="rmse").evaluate(prediction)
+    with mlflow.start_run(nested=True):
+      params = {'maxDepth': int(params['maxDepth']), 
+                    'numTrees': int(params['numTrees']), 
+                   'featureSubsetStrategy': str(int(params['featureSubsetStrategy']))}
+      rf = RandomForestRegressor(labelCol="Weekly_Sales", featuresCol="features",**params)
+      rf_model=rf.fit(trainingData_Assembler)
+      prediction=rf_model.transform(testData_Assembler)
+      score=RegressionEvaluator(labelCol="Weekly_Sales", predictionCol="prediction", metricName="rmse").evaluate(prediction)
+      mlflow.log_param('maxDepth', int(params['maxDepth']))
+      mlflow.log_param('numTrees', int(params['numTrees']))
+      mlflow.log_param('featureSubsetStrategy', str(int(params['featureSubsetStrategy'])))
+      mlflow.log_metric('RMSE',score)
+
     return score
 
-
-# COMMAND ----------
-
 #define search space 
-n_iter=10
+n_iter=15
 features=len(df_random.columns)-1
 space={'maxDepth': hp.quniform('maxDepth', 5, 20, 1),
        'numTrees' : hp.quniform('numTrees', 2, 20, 1),
        'featureSubsetStrategy': hp.quniform('featureSubsetStrategy', 1, features, 1)
       }
 #select search algorithm
-import mlflow
-with mlflow.start_run():
+
+with mlflow.start_run(run_name='untuned_random_forest'):
 
 #since we are using the spark.ml library we do not need spark trials 
   best=fmin(fn=hyper_min,space=space,algo=tpe.suggest,max_evals=n_iter)
 
+
+
 # COMMAND ----------
 
-#final model
-rf=RandomForestRegressor(labelCol="Weekly_Sales", featuresCol="features", maxDepth=int(best['maxDepth']),
-                      numTrees=int(best['numTrees']))
-model=rf.fit(trainingData_Assembler)
-prediction=rf_model.transform(testData_Assembler)
-score=RegressionEvaluator(labelCol="Weekly_Sales", predictionCol="prediction", metricName="rmse").evaluate(prediction)
-print(score)
+best={'featureSubsetStrategy': 7.0, 'maxDepth': 12.0, 'numTrees': 20.0}
+
+
+# COMMAND ----------
+
+#final baseline model
+import mlflow.pyfunc
+with mlflow.start_run(run_name='final_random_forest'):
+
+  rf=RandomForestRegressor(labelCol="Weekly_Sales", featuresCol="features", maxDepth=int(best['maxDepth']),
+                        numTrees=int(best['numTrees']))
+  rf_model=rf.fit(trainingData_Assembler)
+  prediction=rf_model.transform(testData_Assembler)
+  score=RegressionEvaluator(labelCol="Weekly_Sales", predictionCol="prediction", metricName="rmse").evaluate(prediction)
+  mlflow.log_metric('RMSE',score)  
+  run_id = mlflow.active_run().info.run_id
+  
+  mlflow.pyfunc.log_model("random_forest_model", python_model=wrappedModel, conda_env=conda_env, signature=signature)
+
+
+# COMMAND ----------
+
+#run_id = mlflow.search_runs(filter_string='tags.mlflow.runName = "final_random_forest"').iloc[0].run_id
+#print(run_id)
+
+# COMMAND ----------
+
+#model registery
+model_name="walmart_forcast"
+#model_version = mlflow.register_model(f"runs:/{run_id}/random_forest_model", model_name)
+model_version = mlflow.register_model("runs:/dd02b9e617b34202839fea402a824a78/random_forest_model", model_name)
+
+
+# COMMAND ----------
+
+from mlflow.tracking import MlflowClient
+ 
+client = MlflowClient()
+client.transition_model_version_stage(
+  name=model_name,
+  version=model_version.version,
+  stage="Production",
+)
+
+# COMMAND ----------
+
+# new model
+from hyperopt.pyll import scope
+from math import exp
+import mlflow.lightgbm
+import lightgbm as lgb
+ 
+#assemble data
+Y_train,Y_test =trainingData.select['Weekly_Sales'],testData.select['Weekly_Sales']
+(X_train, X_test)=(trainingData.drop['Weekly_Sales'], testData.drop['Weekly_Sales']) 
+
+search_space = {
+  'max_depth': scope.int(hp.quniform('max_depth', 4, 100, 1)),
+  'learning_rate': hp.loguniform('learning_rate', -3, 0),
+  'reg_alpha': hp.loguniform('reg_alpha', -5, -1),
+  'reg_lambda': hp.loguniform('reg_lambda', -6, -1),
+  'min_child_weight': hp.loguniform('min_child_weight', -1, 3),
+  'seed': 123, # Set a seed for deterministic training
+}
+
+#define the model  
+def train_model(params):
+  mlflow.lightgbm.autolog()
+  with mlflow.start_run(nested=True):
+    gbm = lgb.LGBMRegressor(**params)
+    booster = gbm.fit(X_train,Y_train, num_boost_round=200,
+                        eval_set=[(X_test, Y_test)], early_stopping_rounds=20)
+    predictions_test = booster.predict(test)
+    mean_squared_error_score = mean_squared_error(y_test, predictions_test)
+    mlflow.log_metric('mean_squared_error', mean_squared_error_score)
+ 
+    signature = infer_signature(X_train, booster.predict(train))
+    mlflow.lightgbm.log_model(booster, "model", signature=signature)
+    
+    return {'status': STATUS_OK, 'loss': -1*mean_squared_error_score, 'booster': booster.attributes()}
+
+#light gbm is not spark optimized so we need to use spark trials 
+spark_trials = SparkTrials(parallelism=10)
+ 
+with mlflow.start_run(run_name='LGBM_models'):
+  best_params = fmin(
+    fn=train_model, 
+    space=search_space, 
+    algo=tpe.suggest, 
+    max_evals=96,
+    trials=spark_trials, 
+    rstate=np.random.RandomState(123)
+  )
+
+
+# COMMAND ----------
+
+best_run = mlflow.search_runs(order_by=['metrics.mean_squared_error DESC']).iloc[0]
+print(f'RMSE of Best Run: {best_run["metrics.mean_squared_error"]}')
+
+
+# COMMAND ----------
+
+new_model_version = mlflow.register_model(f"runs:/{best_run.run_id}/model", model_name)
+
+
+# COMMAND ----------
+
+#archive old model and move new model to production
+
+client.transition_model_version_stage(
+  name=model_name,
+  version=model_version.version,
+  stage="Archived"
+)
+ 
+client.transition_model_version_stage(
+  name=model_name,
+  version=new_model_version.version,
+  stage="Production"
+)
